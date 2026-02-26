@@ -1,0 +1,106 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+  namespace: observability
+data:
+  otel-collector-config.yaml: |
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+
+      file_storage:
+        directory: /var/lib/otelcol/file_storage
+        timeout: 10s
+
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+
+    processors:
+      memory_limiter:
+        check_interval: 1s
+        limit_mib: 400
+        spike_limit_mib: 80
+
+      batch:
+        timeout: 5s
+        send_batch_size: 512
+        send_batch_max_size: 1024
+
+      resource:
+        attributes:
+          - key: deployment.environment
+            value: edge
+            action: insert
+          - key: cluster.name
+            value: edge-observability
+            action: insert
+
+      tail_sampling:
+        decision_wait: 5s
+        num_traces: 10000
+        expected_new_traces_per_sec: 10
+        policies:
+          - name: error-policy
+            type: status_code
+            status_code:
+              status_codes:
+                - ERROR
+          - name: latency-policy
+            type: latency
+            latency:
+              threshold_ms: 200
+
+    exporters:
+      # Single OTLP exporter to Dash0 for ALL signals.
+      # Unlike the Grafana stack (3 separate exporters), Dash0 accepts
+      # traces, metrics, and logs over one OTLP gRPC endpoint.
+      # This means file-backed persistent queues work for ALL three
+      # signals — including metrics, which was not possible with
+      # prometheusremotewrite. After a network restore, all three
+      # signals backfill (no metric gap).
+      otlp/dash0:
+        endpoint: ${env:DASH0_ENDPOINT}
+        headers:
+          Authorization: ${env:DASH0_AUTH_TOKEN}
+        sending_queue:
+          enabled: true
+          num_consumers: 4
+          queue_size: 1000
+          storage: file_storage
+        retry_on_failure:
+          enabled: true
+          initial_interval: 5s
+          max_interval: 30s
+          max_elapsed_time: 300s
+
+    service:
+      extensions: [health_check, file_storage]
+
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, resource, tail_sampling, batch]
+          exporters: [otlp/dash0]
+
+        metrics:
+          receivers: [otlp]
+          processors: [memory_limiter, resource, batch]
+          exporters: [otlp/dash0]
+
+        logs:
+          receivers: [otlp]
+          processors: [memory_limiter, resource, batch]
+          exporters: [otlp/dash0]
+
+      telemetry:
+        logs:
+          level: info
+        metrics:
+          address: 0.0.0.0:8888
+          level: detailed

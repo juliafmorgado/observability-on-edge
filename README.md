@@ -19,10 +19,11 @@ A production-realistic demo of the full observability stack for edge computing: 
 5. [Quick Start](#quick-start)
 6. [Running the Demo](#running-the-demo)
 7. [Dashboard Guide](#dashboard-guide)
-8. [Configuration Reference](#configuration-reference)
-9. [Design Decisions and Trade-offs](#design-decisions-and-trade-offs)
-10. [Project Structure](#project-structure)
-11. [Troubleshooting](#troubleshooting)
+8. [Dash0 Backend (Alternative)](#dash0-backend-alternative)
+9. [Configuration Reference](#configuration-reference)
+10. [Design Decisions and Trade-offs](#design-decisions-and-trade-offs)
+11. [Project Structure](#project-structure)
+12. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -35,6 +36,7 @@ A production-realistic demo of the full observability stack for edge computing: 
 | **Network resilience** | Simulate a satellite link loss: data queues to disk, the app keeps running, and everything syncs when the link comes back. |
 | **Signal correlation** | Every log entry has a `trace_id` you can click to jump to the trace in Jaeger. Metrics have exemplars linking data points to traces. |
 | **Edge topology** | Two Kubernetes nodes, explicitly labelled `edge` and `hub`, with traffic crossing between them just like a real WAN link. |
+| **Dual backend support** | Run with a local Grafana stack (Jaeger + Prometheus + Loki) or export to Dash0 via a single OTLP endpoint. Dash0 adds file-backed metric queues and full gap-fill on restore. |
 
 ---
 
@@ -42,7 +44,7 @@ A production-realistic demo of the full observability stack for edge computing: 
 
 ```mermaid
 flowchart TB
-    subgraph EDGE["🚢  VESSEL — Edge Node  (k3d agent-0)"]
+    subgraph EDGE["VESSEL — Edge Node  (k3d agent-0)"]
         subgraph APP["edge-demo-app  ·  Go + OpenTelemetry SDK"]
             E1["/api/sensors/engine\n50–80 ms · 50% traffic · no errors"]
             E2["/api/sensors/navigation\n40–60 ms · 30% traffic · no errors"]
@@ -55,9 +57,9 @@ flowchart TB
         COL["OTel Collector  (DaemonSet)\nReceiver: OTLP gRPC :4317 / HTTP :4318\nProcessor: tail_sampling  decision_wait=5s\n  • error-policy: status_code = ERROR\n  • latency-policy: threshold_ms = 200\n  → drops ≈ 85% of spans\nExtension: file_storage  (bbolt)\n  path: /var/lib/otelcol/file_storage\n  traces + logs queue persist across pod restarts\n  metrics: in-memory queue only"]
     end
 
-    SAT(["🛰  Satellite Link\nsimulated via iptables DROP rules\nOn outage → data queues to disk, auto-flushes on restore"])
+    SAT(["Satellite Link\nsimulated via iptables DROP rules\nOn outage → data queues to disk, auto-flushes on restore"])
 
-    subgraph HUB["🏢  SHORE HUB — Hub Node  (k3d agent-1)"]
+    subgraph HUB["SHORE HUB — Hub Node  (k3d agent-1)"]
         J["Jaeger  :4317\nTraces — gap-fills ✓\n(any timestamp accepted)"]
         P["Prometheus  :9090\nMetrics — gap stays ✗\n(out-of-order samples dropped)"]
         L["Loki  :3100\nLogs — gap-fills ✓\n(unordered_writes: true)"]
@@ -326,6 +328,8 @@ Creates a `TestRun` CR. The k6 Operator starts a runner pod. Leave it running fo
 ./scripts/cleanup.sh       # deletes the k3d cluster and all data
 ```
 
+> **Using Dash0 instead of Grafana?** See [Dash0 Backend (Alternative)](#dash0-backend-alternative) for setup and demo instructions. The edge pipeline is identical — only the backend and scripts differ.
+
 ---
 
 ## Running the Demo
@@ -424,6 +428,96 @@ The pipeline view — collector health and the satellite link.
 | Export Throughput | `rate(sent_spans[30s])` + `rate(sent_log_records[30s])` | Drops to 0 on failure, spikes on restore |
 | Permanent Data Drops | `increase(send_failed_spans[5m]) + increase(send_failed_log_records[5m])` | 0 = queue working; increments only after >5 min outage |
 | Queue Depth (batches) | `sum(otelcol_exporter_queue_size) or vector(0)` | Real-time batches on disk; `or vector(0)` ensures the panel shows 0 when queues are empty (OTel only emits this metric when non-zero) |
+
+---
+
+## Dash0 Backend (Alternative)
+
+The repo includes a complete parallel setup that exports to [Dash0](https://www.dash0.com) instead of the local Grafana/Jaeger/Prometheus/Loki stack. The edge pipeline (app, OTel Collector, Fluent Bit) is identical — only the backend changes.
+
+### Why Dash0?
+
+The Grafana setup uses three separate exporters (`otlp/jaeger`, `prometheusremotewrite`, `loki`), each with its own queue. The `prometheusremotewrite` exporter does not support `sending_queue.storage` in OTel Collector v0.95, so metrics queue in memory only and are lost if the pod restarts during an outage.
+
+Dash0 accepts all three signals over a single OTLP gRPC endpoint. This means one exporter (`otlp/dash0`) with one file-backed queue covers traces, metrics, and logs. After a network restore, all three signals backfill — including metrics. No gap.
+
+| | Grafana stack | Dash0 |
+|---|---|---|
+| Exporters | 3 (otlp, prometheusremotewrite, loki) | 1 (otlp/dash0) |
+| File-backed queues | traces + logs only | traces + metrics + logs |
+| Metrics after restore | gap stays (Prometheus drops out-of-order) | gap fills (Dash0 accepts out-of-order) |
+| Hub-node backends | Jaeger, Prometheus, Loki, Grafana | none (SaaS) |
+
+### Setup
+
+1. Edit `k8s/edge-node/dash0-secret.yaml` with your Dash0 credentials:
+   - `auth-token`: your Bearer token (Organization Settings → Auth Tokens)
+   - `endpoint`: your OTLP ingestion endpoint (e.g. `ingress.us-west-2.aws.dash0.com:4317`)
+   - `api-url`: your API base URL (e.g. `https://api.us-west-2.aws.dash0.com`)
+
+2. Run the Dash0 setup:
+
+```bash
+./scripts/setup-dash0.sh
+```
+
+This creates the same k3d cluster and edge pipeline but skips all hub-node backends. The OTel Collector uses `otel-collector-config-dash0.yaml` which has a single `otlp/dash0` exporter.
+
+3. Start the load test and run the demo:
+
+```bash
+./scripts/load-generator.sh
+./scripts/demo-dash0.sh          # full run
+./scripts/demo-dash0.sh 2        # start at Act 2
+./scripts/demo-dash0.sh 3        # start at Act 3
+```
+
+### Network failure scripts
+
+The Dash0 variant has its own failure/restore scripts that block outbound OTLP + TLS traffic (instead of blocking ports to in-cluster backends):
+
+```bash
+./scripts/simulate-network-failure-dash0.sh   # block collector → Dash0
+./scripts/restore-network-dash0.sh            # remove DROP rules
+```
+
+### Dash0 collector config
+
+The key difference is in `k8s/edge-node/otel-collector-config-dash0.yaml`:
+
+```yaml
+exporters:
+  otlp/dash0:
+    endpoint: ${env:DASH0_ENDPOINT}
+    headers:
+      Authorization: ${env:DASH0_AUTH_TOKEN}
+    sending_queue:
+      enabled: true
+      queue_size: 1000
+      storage: file_storage    # file-backed for ALL signals
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+
+service:
+  pipelines:
+    traces:
+      exporters: [otlp/dash0]
+    metrics:
+      exporters: [otlp/dash0]
+    logs:
+      exporters: [otlp/dash0]
+```
+
+All three pipelines share the same exporter and the same file-backed queue. This is the architectural change that makes metrics resilient.
+
+### Known limitation: collector self-telemetry
+
+The custom collector image (`ghcr.io/graz-dev/otel-collector-edge:0.1.0`, based on v0.95.0) does not include the `prometheus` receiver. The collector exposes its own metrics (e.g. `otelcol_exporter_queue_size`) on `:8888` in Prometheus format, but cannot scrape itself to forward those metrics to Dash0 via OTLP. This means the Edge Pipeline dashboard (collector health) will be empty in Dash0 until the collector image is updated to either include `prometheusreceiver` or bump to v0.100+ which supports native OTLP self-telemetry export.
+
+The Vessel Operations dashboard (application metrics) works normally since those metrics come from the app's OTel SDK, not the collector's self-telemetry.
 
 ---
 
@@ -565,10 +659,13 @@ observability-on-edge/
 │   │   ├── app-service.yaml
 │   │   ├── otel-collector-daemonset.yaml
 │   │   ├── otel-collector-service.yaml
-│   │   ├── otel-collector-config.yaml   ← tail_sampling + queue config
+│   │   ├── otel-collector-config.yaml         ← tail_sampling + queue config (Grafana)
+│   │   ├── otel-collector-config-dash0.yaml   ← single OTLP exporter (Dash0)
+│   │   ├── otel-collector-daemonset-dash0.yaml ← DaemonSet with Dash0 env vars
+│   │   ├── dash0-secret.yaml                  ← Dash0 credentials (edit before use)
 │   │   ├── fluentbit-daemonset.yaml
-│   │   └── fluentbit-config.yaml        ← Lua filter + OTLP HTTP output
-│   ├── hub-node/                # Workloads pinned to node-role=hub
+│   │   └── fluentbit-config.yaml              ← Lua filter + OTLP HTTP output
+│   ├── hub-node/                # Workloads pinned to node-role=hub (Grafana backend only)
 │   │   ├── jaeger-{deployment,service}.yaml
 │   │   ├── prometheus-{deployment,service,config}.yaml
 │   │   ├── loki-{deployment,service,config}.yaml
@@ -582,11 +679,15 @@ observability-on-edge/
 │   └── k6-script.js             # 40-min, 8 VU, 4-endpoint traffic mix
 │
 ├── scripts/
-│   ├── setup.sh                 # Full cluster setup (run once)
+│   ├── setup.sh                 # Full cluster setup — Grafana backend (run once)
+│   ├── setup-dash0.sh           # Full cluster setup — Dash0 backend (run once)
 │   ├── load-generator.sh        # Create/recreate the TestRun CR
-│   ├── demo.sh                  # Orchestrated demo runner (Acts 1–3)
-│   ├── simulate-network-failure.sh  # Apply iptables DROP rules
-│   ├── restore-network.sh       # Remove DROP rules
+│   ├── demo.sh                  # Orchestrated demo runner — Grafana (Acts 1-3)
+│   ├── demo-dash0.sh            # Orchestrated demo runner — Dash0 (Acts 1-3)
+│   ├── simulate-network-failure.sh      # Apply iptables DROP rules (Grafana)
+│   ├── simulate-network-failure-dash0.sh # Apply iptables DROP rules (Dash0)
+│   ├── restore-network.sh       # Remove DROP rules (Grafana)
+│   ├── restore-network-dash0.sh # Remove DROP rules (Dash0)
 │   └── cleanup.sh               # Delete the k3d cluster
 │
 └── architecture.mmd             # Mermaid source for the architecture diagram
@@ -646,6 +747,23 @@ docker exec k3d-edge-observability-agent-0 \
   find /var/lib/otelcol/file_storage -type f -delete
 kubectl rollout restart daemonset/otel-collector -n observability
 kubectl rollout status daemonset/otel-collector -n observability --timeout=60s
+```
+
+### Dash0: no data in dashboards
+
+```bash
+# Check collector logs for export errors
+kubectl logs -n observability -l app=otel-collector --tail=30
+
+# Verify credentials are loaded
+kubectl get secret dash0-credentials -n observability -o jsonpath='{.data.endpoint}' | base64 -d
+
+# Test API connectivity
+curl -s -o /dev/null -w "%{http_code}" \
+  "$(kubectl get secret dash0-credentials -n observability -o jsonpath='{.data.api-url}' | base64 -d)/api/prometheus/api/v1/query" \
+  -H "Authorization: $(kubectl get secret dash0-credentials -n observability -o jsonpath='{.data.auth-token}' | base64 -d)" \
+  --data-urlencode "query=up"
+# Should return 200
 ```
 
 ### Manual Prometheus queries

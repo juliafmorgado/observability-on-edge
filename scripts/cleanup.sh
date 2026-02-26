@@ -30,5 +30,6 @@ k3d cluster delete edge-observability
 echo -e "\n${GREEN}✅ Cleanup complete${NC}"
 echo ""
 echo -e "${YELLOW}💡 To redeploy:${NC}"
-echo "  Run: ./scripts/setup.sh"
+echo "  Grafana backend: ./scripts/setup.sh"
+echo "  Dash0 backend:   ./scripts/setup-dash0.sh"
 echo ""
